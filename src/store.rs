@@ -94,6 +94,7 @@ pub struct KeyValueWithPrev {
 pub struct SetRequired {
     pub required_last_revision: Option<i64>,
     pub required_version: Option<i64>,
+    pub compare_result: i32, // 0=EQUAL, 1=GREATER, 2=LESS, 3=NOT_EQUAL
 }
 
 pub struct RangeResult {
@@ -174,7 +175,7 @@ impl Store {
             let d = &wal_settings.unwrap().wal_dir;
             load_wal_dir(d, |rec| {
                 let val_opt = rec.value.map(Bytes::from);
-                let _ = store.set(rec.key, val_opt, None);
+                store.set_for_replay(rec.key, val_opt);
             }).expect("failed to load WAL dir");
         }
 
@@ -228,10 +229,19 @@ impl Store {
                 // Item already exists
                 if existing_item.latest_value.value.is_some() {
                     // Item is not deleted
+                    let cmp = required.as_ref().map(|r| r.compare_result).unwrap_or(0);
+                    let cmp_satisfied = |existing: i64, target: i64| -> bool {
+                        match cmp {
+                            1 => existing > target,    // GREATER
+                            2 => existing < target,    // LESS
+                            3 => existing != target,   // NOT_EQUAL
+                            _ => existing == target,   // EQUAL (default)
+                        }
+                    };
                     if (required_last_revision >= 0
-                        && required_last_revision != existing_item.latest_value.mod_revision)
+                        && !cmp_satisfied(existing_item.latest_value.mod_revision, required_last_revision))
                         || (required_version >= 0
-                            && required_version != existing_item.latest_value.version)
+                            && !cmp_satisfied(existing_item.latest_value.version, required_version))
                     {
                         // failed to update because the mod_revision does not match
                         return Err((
@@ -379,6 +389,94 @@ impl Store {
             .inc();
         // No separate latency histogram here, because set() handles timing
         self.set(key, None, required).await
+    }
+
+    /// Synchronous version of set() for WAL replay during startup.
+    /// Does not notify watchers (none exist yet) and does not append to WAL (we're reading from it).
+    fn set_for_replay(&self, key: ByteArray, value: Option<Bytes>) {
+        let value = value.map(|v| Bytes::from(v));
+        let (prefix, suffix) = Self::prefix_split(&key);
+
+        let placeholder_value = Value {
+            create_revision: 0,
+            mod_revision: 0,
+            version: 1,
+            value: None,
+        };
+
+        if let Some(item_ref) = self.tree_map.get(&key) {
+            let ei = item_ref.clone();
+            drop(item_ref);
+
+            let mut existing_item = ei.write().unwrap();
+
+            if existing_item.latest_value.value.is_some() {
+                // Item exists, update it
+                let new_rev = self.values_by_revision.push(placeholder_value) as i64 + 1;
+                metrics::TREE_MAP_SIZE_BYTES.add(value.as_ref().map(|v| v.len() as i64).unwrap_or(0));
+                let new_value = Value {
+                    create_revision: existing_item.latest_value.create_revision,
+                    mod_revision: new_rev,
+                    version: existing_item.latest_value.version + 1,
+                    value: value,
+                };
+                existing_item.latest_value = new_value;
+                self.values_by_revision.set(new_rev as usize - 1, existing_item.latest_value.clone());
+                existing_item.revisions.push(new_rev);
+            } else {
+                // Item was deleted
+                if value.is_none() {
+                    return;
+                }
+                let new_rev = self.values_by_revision.push(placeholder_value) as i64 + 1;
+                metrics::TREE_MAP_SIZE_BYTES.add(value.as_ref().map(|v| v.len() as i64).unwrap_or(0));
+                let new_value = Value {
+                    create_revision: new_rev,
+                    mod_revision: new_rev,
+                    version: 1,
+                    value: value,
+                };
+                existing_item.latest_value = new_value;
+                self.values_by_revision.set(new_rev as usize - 1, existing_item.latest_value.clone());
+                existing_item.revisions.push(new_rev);
+            }
+            return;
+        }
+
+        // Item does not exist
+        if value.is_none() {
+            return;
+        }
+
+        let new_rev = self.values_by_revision.push(placeholder_value) as i64 + 1;
+        metrics::TREE_MAP_SIZE_BYTES.add(value.as_ref().map(|v| v.len() as i64).unwrap_or(0));
+        let new_value = Value {
+            create_revision: new_rev,
+            mod_revision: new_rev,
+            version: 1,
+            value: value,
+        };
+
+        let item = TreeItem {
+            key: key.clone(),
+            revisions: vec![new_rev],
+            latest_value: new_value,
+        };
+        self.values_by_revision.set(new_rev as usize - 1, item.latest_value.clone());
+
+        let item = Arc::new(RwLock::new(item));
+        {
+            let item = item.clone();
+            let prefix = prefix.to_vec();
+            let suffix = suffix.to_vec();
+            let mut prefix_item =
+                self.prefix_map
+                    .entry(prefix)
+                    .or_insert_with(|| PrefixMapItem { btree: BTreeMap::new() });
+            prefix_item.btree.insert(suffix, item);
+        }
+        self.tree_map.insert(key.clone(), item);
+        metrics::TREE_MAP_ITEM_COUNT.with_label_values(&[&String::from_utf8_lossy(prefix)]).inc();
     }
 
     async fn notify_watchers(&self, key: &ByteArray, value: Value, prev_value: Option<Value>, prefix: &[u8]) {

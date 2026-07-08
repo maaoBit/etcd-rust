@@ -83,6 +83,8 @@ where
     ///
     /// If the last block is full (or doesn't exist), a new block is allocated
     /// under a write lock. Otherwise, only a read lock is taken for the common case.
+    /// This is safe because `fetch_add` guarantees each caller gets a unique offset,
+    /// and the slot is always `None` (no old value to drop).
     pub fn push(&self, value: T) -> usize {
         let index;
         let offset;
@@ -99,7 +101,9 @@ where
 
             if block_index < blocks_read.len() {
                 // There's already a block ready. Put the element in place.
-                // let the_block = &blocks_read[block_index] as *const _ as *mut [Option<T>; BLOCK_SIZE];
+                // SAFETY: `fetch_add` guarantees a unique offset, so no other thread
+                // writes to this slot. The slot is always `None` at this point (newly
+                // allocated via fetch_add), so there is no old value whose Drop must run.
                 let the_block = blocks_read[block_index].as_ptr() as *mut [Option<T>; BLOCK_SIZE];
                 unsafe {
                     (*the_block)[offset] = Some(value);
@@ -140,6 +144,7 @@ where
     }
 
     /// Replaces the element at the given index with `value` if it exists.
+    /// Uses a read lock + unsafe to avoid serializing with concurrent push/get.
     pub fn set(&self, index: usize, value: T) -> bool
     where
         T: Clone,
@@ -157,8 +162,17 @@ where
         let block_index = (index / BLOCK_SIZE) - (start_offset / BLOCK_SIZE);
         let offset = index % BLOCK_SIZE;
 
+        // SAFETY: We hold a read lock on `blocks`, which prevents structural changes
+        // (push of new blocks, remove_before) but allows concurrent access to existing
+        // blocks. The slot at `offset` is only written by the single thread that owns
+        // this revision (protected by TreeItem write lock in store.rs), so there is no
+        // concurrent write to the same slot.
+        // We must drop_in_place the old value before overwriting, because writing
+        // through a raw pointer does not call Drop. Without this, Value::Drop would
+        // never run for the old value, causing metric leaks (TREE_MAP_SIZE_BYTES drift).
         let the_block = blocks_read[block_index].as_ptr() as *mut [Option<T>; BLOCK_SIZE];
         unsafe {
+            std::ptr::drop_in_place(&mut (*the_block)[offset]);
             (*the_block)[offset] = Some(value);
         }
         true

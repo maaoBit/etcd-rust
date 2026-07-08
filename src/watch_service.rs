@@ -41,7 +41,11 @@ impl Watch for WatchService {
         // Implement Watch RPC
         let remote_addr = request.remote_addr();
         let mut req_inner = request.into_inner();
-        let watch_req = req_inner.message().await.unwrap().unwrap();
+        let watch_req = match req_inner.message().await {
+            Ok(Some(req)) => req,
+            Ok(None) => return Err(Status::cancelled("client closed stream before sending request")),
+            Err(e) => return Err(Status::from(e)),
+        };
         let create_req = if let Some(
             crate::etcdserverpb::watch_request::RequestUnion::CreateRequest(create_req),
         ) = watch_req.request_union
@@ -117,6 +121,11 @@ impl Watch for WatchService {
             }
 
             let mut max_event_stream_rev = 0;
+            // Compute max revision from past changes for deduplication.
+            // Events from the watcher channel with mod_revision <= this value
+            // are duplicates (already sent in past_changes) and should be skipped.
+            let max_past_rev = past_changes.last().map(|c| c.kv.mod_revision).unwrap_or(0);
+            max_event_stream_rev = max_past_rev;
             loop {
                 let mut read_many = Vec::with_capacity(100);
                 tokio::select! {
@@ -124,6 +133,11 @@ impl Watch for WatchService {
                     biased;
 
                     _num_read = rx.recv_many(&mut read_many, 1000) => {
+                        // Filter out duplicate events that were already sent in past_changes
+                        read_many.retain(|c| c.kv.mod_revision > max_event_stream_rev);
+                        if read_many.is_empty() {
+                            continue;
+                        }
                         let last_rev = read_many.last().unwrap().kv.mod_revision;
                         max_event_stream_rev = std::cmp::max(last_rev, max_event_stream_rev);
                         yield WatchResponse {
@@ -153,7 +167,9 @@ impl Watch for WatchService {
                                 return;
                             }
                             Ok(None) => {
-                                continue;
+                                // Client closed the stream; stop watching and exit.
+                                store.unwatch(key, watcher_id);
+                                return;
                             }
                             Ok(Some(client_msg)) => {
                                 match client_msg.request_union {

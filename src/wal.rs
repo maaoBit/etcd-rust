@@ -82,14 +82,13 @@ impl WalManager {
             writers_with_work_tx: tx.clone(),
         };
 
-        Self::spawn_writer_threads(rx, tx);
+        Self::spawn_writer_threads(rx);
         Ok(s)
     }
 
-    fn spawn_writer_threads(writers_with_work_rx: Receiver<Arc<PerPrefixWriter>>, writers_with_work_tx: Sender<Arc<PerPrefixWriter>>) {
+    fn spawn_writer_threads(writers_with_work_rx: Receiver<Arc<PerPrefixWriter>>) {
         for _ in 0..std::thread::available_parallelism().unwrap().get() {
             let rx = writers_with_work_rx.clone();
-            let tx = writers_with_work_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(writer) = rx.recv() {
                     if writer.to_write_rx.is_empty() {
@@ -104,7 +103,7 @@ impl WalManager {
                     writer.is_writing.store(false, std::sync::atomic::Ordering::SeqCst);
                     if !writer.to_write_rx.is_empty() {
                         // if writer didn't write everything there is still more work to do
-                        tx.send(writer.clone()).unwrap();
+                        let _ = writer.writers_with_work_tx.send(writer.clone());
                     }
                 }
             });
@@ -118,11 +117,15 @@ impl WalManager {
     // append is to be called in rev order
     pub fn append(&self, prefix: &[u8], rev: i64, key: &[u8], value: Option<&[u8]>, written_notify: Option<Arc<Notify>>) {
         if self.default_mode == WalMode::None || self.prefix_modes_no_persist.contains(prefix) {
+            // Notify the caller even though we're not persisting, so they don't hang forever.
+            if let Some(notify) = written_notify {
+                notify.notify_one();
+            }
             return;
         }
 
         let writer = self.writers.entry(prefix.to_vec()).or_insert_with(||
-            Arc::new(PerPrefixWriter::open_for_prefix(&self.wal_dir, &prefix, self.default_mode).expect("open WAL file"))
+            Arc::new(PerPrefixWriter::open_for_prefix(&self.wal_dir, &prefix, self.default_mode, self.writers_with_work_tx.clone()).expect("open WAL file"))
         );
         writer.to_write_tx.send(WalRecord { rev, key: key.to_vec(), value: value.map(|v| v.to_vec()), written_notify }).unwrap();
         self.writers_with_work_tx.send(writer.clone()).unwrap();
@@ -137,10 +140,19 @@ struct PerPrefixWriter {
     to_write_tx: Sender<WalRecord>,
     to_write_rx: Receiver<WalRecord>,
     mode: WalMode,
+    writers_with_work_tx: Sender<Arc<PerPrefixWriter>>,
+}
+
+impl Drop for PerPrefixWriter {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd); }
+        }
+    }
 }
 
 impl PerPrefixWriter {
-    fn open_for_prefix(wal_dir: &Path, prefix: &[u8], mode: WalMode) -> std::io::Result<Self> {
+    fn open_for_prefix(wal_dir: &Path, prefix: &[u8], mode: WalMode, writers_with_work_tx: Sender<Arc<PerPrefixWriter>>) -> std::io::Result<Self> {
         let path = wal_dir.join(Self::file_name_for_prefix(prefix));
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         let file = OpenOptions::new()
@@ -159,6 +171,7 @@ impl PerPrefixWriter {
             to_write_tx: tx,
             to_write_rx: rx,
             mode,
+            writers_with_work_tx,
         })
     }
 
@@ -214,7 +227,7 @@ impl PerPrefixWriter {
         let mut remaining = current_size;
         let mut iovs_offset = 0;
         while remaining > 0 {
-            let res = unsafe { libc::writev(self.fd, iovs_vec.as_ptr().add(iovs_offset), iovs_vec.len() as i32) };
+            let res = unsafe { libc::writev(self.fd, iovs_vec.as_ptr().add(iovs_offset), (iovs_vec.len() - iovs_offset) as i32) };
             if res < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted { continue; }

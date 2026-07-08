@@ -72,10 +72,28 @@ impl Kv for KvService {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
+        // Get previous value if prev_kv is requested or ignore_value is set
+        let prev_kv = if req.prev_kv || req.ignore_value {
+            let range_result = self.store.range(req.key.clone(), vec![], 0, Some(1))?;
+            range_result.kvs.into_iter().next()
+        } else {
+            None
+        };
+
+        // Handle ignore_value: keep existing value instead of using request value
+        let value = if req.ignore_value {
+            match &prev_kv {
+                Some(kv) => Some(Bytes::from(kv.value.clone())),
+                None => return Err(Status::invalid_argument("ignore_value set but key does not exist")),
+            }
+        } else {
+            Some(Bytes::from(req.value))
+        };
+
         // Perform the put operation on the store
         let rev = self
             .store
-            .set(req.key, Some(Bytes::from(req.value)), None)
+            .set(req.key, value, None)
             .await
             .map_err(|e| Status::internal(format!("Put operation failed: {:?}", e)))?;
 
@@ -87,10 +105,7 @@ impl Kv for KvService {
                 raft_term: 0,
                 revision: rev,
             }),
-            prev_kv: None,
-            // Note: Previous key-value (PrevKv) is not handled here as per Go implementation.
-            // To include PrevKv, additional logic is required.
-            // prev_kv: None,
+            prev_kv: if req.prev_kv { prev_kv } else { None },
         };
 
         Ok(Response::new(response))
@@ -106,21 +121,41 @@ impl Kv for KvService {
             return Err(Status::invalid_argument("range end not supported in deleteRange"));
         }
 
-        self.store
-            .delete(req.key, None)
-            .await
-            .map_err(|e| Status::internal(format!("Delete operation failed: {:?}", e)))?;
+        // Get previous value if prev_kv is requested
+        let prev_kv = if req.prev_kv {
+            let range_result = self.store.range(req.key.clone(), vec![], 0, Some(1))?;
+            range_result.kvs.into_iter().next()
+        } else {
+            None
+        };
 
-        Ok(Response::new(DeleteRangeResponse {
-            prev_kvs: Vec::new(),
-            deleted: 1,
-            header: Some(ResponseHeader {
-                cluster_id: 0,
-                member_id: 0,
-                raft_term: 0,
-                revision: 0,
-            }),
-        }))
+        match self.store.delete(req.key, None).await {
+            Ok(rev) => {
+                Ok(Response::new(DeleteRangeResponse {
+                    prev_kvs: if req.prev_kv { prev_kv.map(|kv| vec![kv]).unwrap_or_default() } else { Vec::new() },
+                    deleted: 1,
+                    header: Some(ResponseHeader {
+                        cluster_id: 0,
+                        member_id: 0,
+                        raft_term: 0,
+                        revision: rev,
+                    }),
+                }))
+            }
+            Err((rev, _)) => {
+                // Key doesn't exist — etcd returns success with deleted: 0
+                Ok(Response::new(DeleteRangeResponse {
+                    prev_kvs: Vec::new(),
+                    deleted: 0,
+                    header: Some(ResponseHeader {
+                        cluster_id: 0,
+                        member_id: 0,
+                        raft_term: 0,
+                        revision: rev,
+                    }),
+                }))
+            }
+        }
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
@@ -163,17 +198,23 @@ impl Kv for KvService {
             return Err(Status::invalid_argument("only one compare supported"));
         }
         let required: Option<SetRequired>;
-        match req.compare[0].target_union.as_ref().unwrap() {
+        let target_union = match req.compare[0].target_union.as_ref() {
+            Some(t) => t,
+            None => return Err(Status::invalid_argument("compare target_union is required")),
+        };
+        match target_union {
             crate::etcdserverpb::compare::TargetUnion::ModRevision(mod_revision) => {
                 required = Some(SetRequired {
                     required_last_revision: Some(*mod_revision),
                     required_version: None,
+                    compare_result: req.compare[0].result,
                 });
             }
             crate::etcdserverpb::compare::TargetUnion::Version(version) => {
                 required = Some(SetRequired {
                     required_last_revision: None,
                     required_version: Some(*version),
+                    compare_result: req.compare[0].result,
                 });
             }
             _ => {
@@ -348,7 +389,7 @@ impl Kv for KvService {
                 cluster_id: 0,
                 member_id: 0,
                 raft_term: 0,
-                revision: 0,
+                revision: self.store.current_revision(),
             }),
         }))
     }
