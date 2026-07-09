@@ -25,7 +25,7 @@ pub type NodeId = u64;
 /// Each variant maps to a Store operation.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RaftRequest {
-    Set { key: Vec<u8>, value: Vec<u8> },
+    Set { key: Vec<u8>, value: Bytes },
     Delete { key: Vec<u8> },
 }
 
@@ -156,6 +156,14 @@ struct StateMachineData {
     last_membership: StoredMembership<NodeId, BasicNode>,
 }
 
+/// Full snapshot data including KV store data.
+#[derive(Serialize, Deserialize)]
+struct FullSnapshotData {
+    last_applied_log: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
+    kv_entries: Vec<(Vec<u8>, Vec<u8>, i64, i64, i64)>, // (key, value, create_rev, mod_rev, version)
+}
+
 #[derive(Debug)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
@@ -185,7 +193,18 @@ impl StateMachineStore {
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let sm = self.sm.read().await;
-        let data = serde_json::to_vec(&*sm)
+
+        // Export KV data from the store
+        let kv_entries = self.store.export_snapshot_data();
+
+        let snap_data = FullSnapshotData {
+            last_applied_log: sm.last_applied_log,
+            last_membership: sm.last_membership.clone(),
+            kv_entries,
+        };
+        drop(sm);
+
+        let data = serde_json::to_vec(&snap_data)
             .map_err(|e| {
                 let io_err = std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
                 StorageError::from_io_error(
@@ -194,9 +213,8 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
                     io_err,
                 )
             })?;
-        let last_applied_log = sm.last_applied_log;
-        let last_membership = sm.last_membership.clone();
-        drop(sm);
+        let last_applied_log = snap_data.last_applied_log;
+        let last_membership = snap_data.last_membership;
 
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = if let Some(last) = last_applied_log {
@@ -251,11 +269,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                 EntryPayload::Normal(ref req) => {
                     let rev = match req {
                         RaftRequest::Set { key, value } => {
-                            let val = if value.is_empty() {
-                                Some(Bytes::new())
-                            } else {
-                                Some(Bytes::from(value.clone()))
-                            };
+                            let val = Some(value.clone());
                             match self.store.set(key.clone(), val, None).await {
                                 Ok(rev) => rev,
                                 Err((rev, _)) => rev,
@@ -299,8 +313,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             data: data.clone(),
         };
 
-        // Restore state machine metadata
-        let recovered: StateMachineData = serde_json::from_slice(&data)
+        // Restore full snapshot data (KV data + Raft metadata)
+        let recovered: FullSnapshotData = serde_json::from_slice(&data)
             .map_err(|e| {
                 let io_err = std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
                 StorageError::from_io_error(
@@ -309,6 +323,11 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                     io_err,
                 )
             })?;
+
+        // Restore KV data into the store
+        self.store.import_snapshot_data(recovered.kv_entries);
+
+        // Restore state machine metadata
         let mut sm = self.sm.write().await;
         sm.last_applied_log = recovered.last_applied_log;
         sm.last_membership = recovered.last_membership;

@@ -82,7 +82,7 @@ async fn raft_write(
     let resp = leader
         .client_write(RaftRequest::Set {
             key: key.to_vec(),
-            value: value.to_vec(),
+            value: Bytes::copy_from_slice(value),
         })
         .await?;
     Ok(resp.data)
@@ -373,7 +373,7 @@ async fn test_empty_value() {
     let resp = leader_raft
         .client_write(RaftRequest::Set {
             key: b"/test/empty".to_vec(),
-            value: vec![],
+            value: Bytes::new(),
         })
         .await
         .unwrap();

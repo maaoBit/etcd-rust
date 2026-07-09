@@ -66,7 +66,7 @@ impl Watch for WatchService {
         );
         if watch_result.is_err() {
             // Print the error
-            println!("Error: in watch of {:?}", key_dbg);
+            log::debug!("Error: in watch of {:?}", key_dbg);
             return Ok(Response::new(Box::pin(tokio_stream::once(Ok(
                 WatchResponse {
                     header: Some(ResponseHeader {
@@ -78,7 +78,7 @@ impl Watch for WatchService {
             )))));
         }
         let (past_changes, watcher_id, mut rx) = watch_result.unwrap();
-        println!("Watch stream opened watcher_id={:?} start={:?} end={:?} rev={:?} remote_addr={:?}", watcher_id, key_dbg, key_dbg_end, create_req.start_revision, remote_addr);
+        log::debug!("Watch stream opened watcher_id={:?} start={:?} end={:?} rev={:?} remote_addr={:?}", watcher_id, key_dbg, key_dbg_end, create_req.start_revision, remote_addr);
 
         // Clone necessary data to avoid lifetime issues
         let store = self.store.clone();
@@ -109,7 +109,7 @@ impl Watch for WatchService {
                         .into_iter()
                         .map(|kv| crate::mvccpb::Event {
                             prev_kv: if prev_kv { kv.prev_kv } else { None },
-                            r#type: if kv.kv.value.is_empty() {
+                            r#type: if kv.kv.version == 0 {
                                 crate::mvccpb::event::EventType::Delete as i32
                             } else {
                                 crate::mvccpb::event::EventType::Put as i32
@@ -133,6 +133,11 @@ impl Watch for WatchService {
                     biased;
 
                     _num_read = rx.recv_many(&mut read_many, 1000) => {
+                        if _num_read == 0 {
+                            // Channel closed, stop watching
+                            store.unwatch(key, watcher_id);
+                            return;
+                        }
                         // Filter out duplicate events that were already sent in past_changes
                         read_many.retain(|c| c.kv.mod_revision > max_event_stream_rev);
                         if read_many.is_empty() {
@@ -148,7 +153,7 @@ impl Watch for WatchService {
                             watch_id: watcher_id,
                             events: read_many.into_iter().map(|kv| crate::mvccpb::Event {
                                 prev_kv: if prev_kv { kv.prev_kv } else { None },
-                                r#type: if kv.kv.value.is_empty() {
+                                r#type: if kv.kv.version == 0 {
                                     crate::mvccpb::event::EventType::Delete as i32
                                 } else {
                                     crate::mvccpb::event::EventType::Put as i32
@@ -162,7 +167,7 @@ impl Watch for WatchService {
                         // A message from the client
                         match client_msg {
                             Err(e) => {
-                                println!("Error: in watch of {:?}: {:?}", key_dbg, e);
+                                log::debug!("Error: in watch of {:?}: {:?}", key_dbg, e);
                                 store.unwatch(key, watcher_id);
                                 return;
                             }
@@ -178,14 +183,14 @@ impl Watch for WatchService {
                                             store.unwatch(key, watcher_id);
                                             return;
                                         } else {
-                                            println!("watcher_id={:?} received cancel_req with watch_id={:?}, ignoring", watcher_id, cancel_req.watch_id);
+                                            log::debug!("watcher_id={:?} received cancel_req with watch_id={:?}, ignoring", watcher_id, cancel_req.watch_id);
                                         }
                                     }
                                     Some(crate::etcdserverpb::watch_request::RequestUnion::ProgressRequest(_progress_req)) => {
                                         // Progress is to send a Response whose Header contains the latest revision. The watch stream should not
                                         // subsequently return any revisions earlier than the progress revision.
 
-                                        println!("watcher_id={:?} progress_revision={:?} max_event_stream_rev={:?}", watcher_id, store.progress_revision(), max_event_stream_rev);
+                                        log::debug!("watcher_id={:?} progress_revision={:?} max_event_stream_rev={:?}", watcher_id, store.progress_revision(), max_event_stream_rev);
                                         // store.progress_revision() is updated after items have been enqueued in the 'rx' stream.
                                         // There's a small potential race that items have been enqueued but store.progress_revision() hasn't been updated yet.
                                         // So we use the max of either the last rev we've delivered or the store's idea of progress_revision()

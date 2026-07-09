@@ -24,7 +24,7 @@ impl LeaseService {
     pub fn new(_store: Arc<Store>) -> Self {
         LeaseService {
             _store,
-            lease_id: AtomicI64::new(0),
+            lease_id: AtomicI64::new(1),
         }
     }
 }
@@ -81,7 +81,7 @@ impl Lease for LeaseService {
         };
 
         // Just a placeholder log statement
-        println!("Revoking lease: {}", req.id);
+        log::debug!("Revoking lease: {}", req.id);
 
         Ok(Response::new(response))
     }
@@ -109,8 +109,7 @@ impl Lease for LeaseService {
     ) -> Result<Response<Self::LeaseKeepAliveStream>, Status> {
         // For now, return an empty stream to satisfy the trait
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        // tx.send(None).await.unwrap();
-        tx.send(Ok(LeaseKeepAliveResponse {
+        let _ = tx.send(Ok(LeaseKeepAliveResponse {
             header: Some(ResponseHeader {
                 cluster_id: 0,
                 member_id: 0,
@@ -119,8 +118,7 @@ impl Lease for LeaseService {
             }),
             ..Default::default()
         }))
-        .await
-        .unwrap();
+        .await;
         let stream = ReceiverStream::new(rx);
         /*
         .map(|item| Ok(LeaseKeepAliveResponse {

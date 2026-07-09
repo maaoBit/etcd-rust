@@ -47,10 +47,42 @@ impl KvService {
 
     /// Propose a write through Raft and return the revision.
     async fn raft_write(&self, req: RaftRequest) -> Result<i64, Status> {
-        let raft = self.raft.as_ref().unwrap();
+        let raft = self.raft.as_ref()
+            .ok_or_else(|| Status::failed_precondition("raft not enabled"))?;
         let resp = raft.client_write(req).await
             .map_err(|e| Status::internal(format!("raft write failed: {:?}", e)))?;
         Ok(resp.data.revision)
+    }
+
+    /// Best-effort compare check for txn operations.
+    /// Checks if the current key state satisfies the required conditions.
+    fn check_compare(current_kv: &Option<KeyValue>, required: &Option<SetRequired>) -> bool {
+        let required_last_revision = required.as_ref().and_then(|r| r.required_last_revision).unwrap_or(-1);
+        let required_version = required.as_ref().and_then(|r| r.required_version).unwrap_or(-1);
+        let cmp = required.as_ref().map(|r| r.compare_result).unwrap_or(0);
+        let cmp_satisfied = |existing: i64, target: i64| -> bool {
+            match cmp {
+                1 => existing > target,    // GREATER
+                2 => existing < target,     // LESS
+                3 => existing != target,    // NOT_EQUAL
+                _ => existing == target,   // EQUAL (default)
+            }
+        };
+        match current_kv {
+            Some(kv) => {
+                if required_last_revision >= 0 && !cmp_satisfied(kv.mod_revision, required_last_revision) {
+                    return false;
+                }
+                if required_version >= 0 && !cmp_satisfied(kv.version, required_version) {
+                    return false;
+                }
+                true
+            }
+            None => {
+                // Key doesn't exist
+                required_last_revision <= 0 && required_version <= 0
+            }
+        }
     }
 }
 
@@ -129,7 +161,7 @@ impl Kv for KvService {
             self.ensure_leader()?;
             self.raft_write(RaftRequest::Set {
                 key: req.key.clone(),
-                value: req.value.clone(),
+                value: value.unwrap_or_default(),
             }).await?
         } else {
             // Single-node mode: write directly
@@ -163,13 +195,13 @@ impl Kv for KvService {
             return Err(Status::invalid_argument("range end not supported in deleteRange"));
         }
 
-        // Get previous value if prev_kv is requested
-        let prev_kv = if req.prev_kv {
+        // Always check if key exists for accurate deleted count
+        let existing_kv = {
             let range_result = self.store.range(req.key.clone(), vec![], 0, Some(1))?;
             range_result.kvs.into_iter().next()
-        } else {
-            None
         };
+        let deleted = if existing_kv.is_some() { 1 } else { 0 };
+        let prev_kv = if req.prev_kv { existing_kv } else { None };
 
         let rev = if self.raft.is_some() {
             // Raft mode: propose through consensus
@@ -185,7 +217,6 @@ impl Kv for KvService {
             }
         };
 
-        let deleted = if prev_kv.is_some() { 1 } else { 0 };
         Ok(Response::new(DeleteRangeResponse {
             prev_kvs: if req.prev_kv { prev_kv.map(|kv| vec![kv]).unwrap_or_default() } else { Vec::new() },
             deleted,
@@ -234,7 +265,7 @@ impl Kv for KvService {
         */
         let mut req = request.into_inner();
         if req.compare.len() != 1 {
-            println!("Unsupported txn: {:?}", req);
+            log::debug!("Unsupported txn: {:?}", req);
             return Err(Status::invalid_argument("only one compare supported"));
         }
         let required: Option<SetRequired>;
@@ -258,16 +289,16 @@ impl Kv for KvService {
                 });
             }
             _ => {
-                println!("Unsupported compare: {:?}", req.compare[0]);
+                log::debug!("Unsupported compare: {:?}", req.compare[0]);
                 return Err(Status::invalid_argument("only MOD or VERSION target supported"));
             }
         }
         if req.success.len() != 1 {
-            println!("Unsupported txn: {:?}", req);
+            log::debug!("Unsupported txn: {:?}", req);
             return Err(Status::invalid_argument("only one success supported"));
         }
         if req.failure.len() > 1 {
-            println!("Unsupported txn: {:?}", req);
+            log::debug!("Unsupported txn: {:?}", req);
             return Err(Status::invalid_argument("only one failure supported"));
         }
         if !req.failure.is_empty() {
@@ -276,13 +307,13 @@ impl Kv for KvService {
                     crate::etcdserverpb::request_op::Request::RequestRange(range_req) => {
                         let failure_key = &range_req.key;
                         if *failure_key != req.compare[0].key {
-                            println!("Unsupported txn: {:?}", req);
+                            log::debug!("Unsupported txn: {:?}", req);
                             return Err(Status::invalid_argument(
                                 "compare key must match failure key",
                             ));
                         }
                         if !range_req.range_end.is_empty() {
-                            println!("Unsupported txn: {:?}", req);
+                            log::debug!("Unsupported txn: {:?}", req);
                             return Err(Status::invalid_argument(
                                 "range end not supported in failure",
                             ));
@@ -314,7 +345,23 @@ impl Kv for KvService {
                 if put.key != req.compare[0].key {
                     return Err(Status::invalid_argument("compare key must match put key"));
                 }
-                result = self.store.set(put.key, Some(Bytes::from(put.value)), required).await;
+                if self.raft.is_some() {
+                    self.ensure_leader()?;
+                    // Best-effort compare check locally before proposing through Raft
+                    let range_result = self.store.range(put.key.clone(), vec![], 0, Some(1))?;
+                    let current_kv = range_result.kvs.into_iter().next();
+                    if !Self::check_compare(&current_kv, &required) {
+                        result = Err((range_result.latest_rev, current_kv));
+                    } else {
+                        let rev = self.raft_write(RaftRequest::Set {
+                            key: put.key.clone(),
+                            value: Bytes::from(put.value),
+                        }).await?;
+                        result = Ok(rev);
+                    }
+                } else {
+                    result = self.store.set(put.key, Some(Bytes::from(put.value)), required).await;
+                }
             }
             crate::etcdserverpb::request_op::Request::RequestDeleteRange(delete_range) => {
                 success_is_delete = true;
@@ -333,7 +380,21 @@ impl Kv for KvService {
                         "compare key must match deleteRange key",
                     ));
                 }
-                result = self.store.set(delete_range.key, None, required).await;
+                if self.raft.is_some() {
+                    self.ensure_leader()?;
+                    let range_result = self.store.range(delete_range.key.clone(), vec![], 0, Some(1))?;
+                    let current_kv = range_result.kvs.into_iter().next();
+                    if !Self::check_compare(&current_kv, &required) {
+                        result = Err((range_result.latest_rev, current_kv));
+                    } else {
+                        let rev = self.raft_write(RaftRequest::Delete {
+                            key: delete_range.key.clone(),
+                        }).await?;
+                        result = Ok(rev);
+                    }
+                } else {
+                    result = self.store.set(delete_range.key, None, required).await;
+                }
             }
             _ => {
                 return Err(Status::invalid_argument(
@@ -397,7 +458,7 @@ impl Kv for KvService {
                                         ..Default::default()
                                     }),
                                     prev_kvs: vec![],
-                                    deleted: 0, // TODO
+                                    deleted: 1,
                                 }
                             ))
                         }];

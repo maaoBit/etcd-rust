@@ -216,165 +216,154 @@ impl Store {
             value: None,
         };
 
+        // Atomically get-or-create the TreeItem using entry().
+        // This eliminates the race condition where two concurrent set() calls
+        // for the same new key both create separate TreeItems.
         metrics::LOCK_COUNT.with_label_values(&["set", "tree_map", "write"]).inc();
         let lock_time = Instant::now();
-        if let Some(item_ref) = self.tree_map.get(&key) {
-            // Release the self.tree_map lock as early as possible
-            let ei = item_ref.clone();
-            drop(item_ref);
+        let is_new_item;
+        let item_arc = match self.tree_map.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                let arc = occupied.get().clone();
+                drop(occupied);
+                is_new_item = false;
+                arc
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                // Key does not exist - create a placeholder TreeItem.
+                // The placeholder has value=None (looks "deleted"), which is handled
+                // by the compare check below for new/deleted keys.
+                let item = Arc::new(RwLock::new(TreeItem {
+                    key: key.clone(),
+                    revisions: vec![],
+                    latest_value: Value {
+                        create_revision: 0,
+                        mod_revision: 0,
+                        version: 0,
+                        value: None,
+                    },
+                }));
+                vacant.insert(item.clone());
+                // vacant is consumed by insert(), no need to drop
 
-            let (new_rev, key_for_watchers, value_for_watchers, old_value) = {
-                let mut existing_item = ei.write().unwrap();
-                metrics::LOCK_TIME_SECONDS.with_label_values(&["set", "tree_map", "write"]).inc_by(lock_time.elapsed().as_secs_f64());
-                // Item already exists
-                if existing_item.latest_value.value.is_some() {
-                    // Item is not deleted
-                    let cmp = required.as_ref().map(|r| r.compare_result).unwrap_or(0);
-                    let cmp_satisfied = |existing: i64, target: i64| -> bool {
-                        match cmp {
-                            1 => existing > target,    // GREATER
-                            2 => existing < target,    // LESS
-                            3 => existing != target,   // NOT_EQUAL
-                            _ => existing == target,   // EQUAL (default)
-                        }
-                    };
-                    if (required_last_revision >= 0
-                        && !cmp_satisfied(existing_item.latest_value.mod_revision, required_last_revision))
-                        || (required_version >= 0
-                            && !cmp_satisfied(existing_item.latest_value.version, required_version))
-                    {
-                        // failed to update because the mod_revision does not match
-                        return Err((
-                            latest_rev,
-                            Some(Self::as_mvcc_key_value(
-                                existing_item.latest_value.clone(),
-                                &existing_item.key,
-                            )),
-                        ));
-                    }
-                } else {
-                    // Item has been deleted
-                    if required_last_revision > 0 || required_version > 0 {
-                        // This item does not exist, so anything but 0 for required version or rev is an error
-                        return Err((latest_rev, None));
-                    }
-                    if value.is_none() {
-                        // trying to delete a non-existent key
-                        return Err((latest_rev, None));
-                    }
-                }
-
-                // see if we should filter out revisions that have been compacted
-                let earliest_revision = self.values_by_revision.earliest_revision() as i64;
-                if existing_item.revisions.first().unwrap_or(&earliest_revision)
-                    < &earliest_revision
+                // Also insert into prefix_map (tree_map already has the key,
+                // so any concurrent set() will find it via entry())
                 {
-                    let earliest_idx = existing_item
-                        .revisions
-                        .partition_point(|v| v < &earliest_revision);
-                    existing_item.revisions.drain(..earliest_idx);
+                    let prefix_lock_time = Instant::now();
+                    let mut prefix_item =
+                        self.prefix_map
+                            .entry(prefix.to_vec())
+                            .or_insert_with(|| PrefixMapItem {
+                                btree: BTreeMap::new(),
+                            });
+                    let elapsed = prefix_lock_time.elapsed().as_secs_f64();
+                    prefix_item.btree.insert(suffix.to_vec(), item.clone());
+                    drop(prefix_item);
+                    metrics::LOCK_TIME_SECONDS.with_label_values(&["set", "prefix_map", "write"]).inc_by(elapsed);
+                    metrics::LOCK_COUNT.with_label_values(&["set", "prefix_map", "write"]).inc();
                 }
 
-                // The placeholder value is temporary, it gets modified and re-set once we have the revision number
-                let new_rev = self.values_by_revision.push(placeholder_value) as i64 + 1;
-
-                metrics::TREE_MAP_SIZE_BYTES.add(value.as_ref().map(|v| v.len() as i64).unwrap_or(0));
-                let mut new_value = Value {
-                    create_revision: 0,
-                    mod_revision: new_rev,
-                    version: 0,
-                    value: value
-                };
-                if existing_item.latest_value.value.is_some() {
-                    // Modifying an existing item
-                    new_value.create_revision = existing_item.latest_value.create_revision;
-                    new_value.version = existing_item.latest_value.version + 1;
-                } else {
-                    // New item
-                    new_value.create_revision = new_rev;
-                    new_value.version = 1;
-                }
-
-                let old_value = existing_item.latest_value.clone();
-                existing_item.latest_value = new_value;
-
-                let key_for_watchers = existing_item.key.clone();
-                let value_for_watchers = existing_item.latest_value.clone();
-
-                self.values_by_revision
-                    .set(new_rev as usize - 1, existing_item.latest_value.clone());
-                existing_item.revisions.push(new_rev);
-
-                (new_rev, key_for_watchers, value_for_watchers, old_value)
-            }; // guard dropped here
-
-            self.notify_watchers(&key_for_watchers, value_for_watchers, Some(old_value), prefix).await;
-
-            return Ok(new_rev);
-        } else {
-            metrics::LOCK_TIME_SECONDS.with_label_values(&["set", "tree_map", "write"]).inc_by(lock_time.elapsed().as_secs_f64());
-        }
-
-        // Item does not exist
-
-        if required_last_revision > 0 || required_version > 0 {
-            // This item does not exist, so anything but 0 for required version or rev is an error
-            return Err((latest_rev, None));
-        }
-
-        if value.is_none() {
-            // trying to delete a non-existent key
-            return Err((latest_rev, None));
-        }
-
-        let new_rev = self.values_by_revision.push(placeholder_value) as i64 + 1;
-
-        metrics::TREE_MAP_SIZE_BYTES.add(value.as_ref().map(|v| v.len() as i64).unwrap_or(0));
-        let new_value = Value {
-            create_revision: new_rev,
-            mod_revision: new_rev,
-            version: 1,
-            value: value
+                metrics::TREE_MAP_ITEM_COUNT.with_label_values(&[&String::from_utf8_lossy(prefix)]).inc();
+                is_new_item = true;
+                item
+            }
         };
-
-        let item = TreeItem {
-            key: key.clone(),
-            revisions: vec![new_rev],
-            latest_value: new_value,
-        };
-        self.values_by_revision
-            .set(new_rev as usize - 1, item.latest_value.clone());
-
-        let value_for_watchers = item.latest_value.clone();
-
-        let item = Arc::new(RwLock::new(item));
-        {
-            // Do these things before we take the lock
-            let item = item.clone();
-            let prefix = prefix.to_vec();
-            let suffix = suffix.to_vec();
-
-            let lock_time = Instant::now();
-            let mut prefix_item =
-                self.prefix_map
-                    .entry(prefix)
-                    .or_insert_with(|| PrefixMapItem {
-                        btree: BTreeMap::new(),
-                    });
-            let elapsed = lock_time.elapsed().as_secs_f64();
-            prefix_item.btree.insert(suffix, item);
-            drop(prefix_item);
-            metrics::LOCK_TIME_SECONDS.with_label_values(&["set", "prefix_map", "write"]).inc_by(elapsed);
-            metrics::LOCK_COUNT.with_label_values(&["set", "prefix_map", "write"]).inc();
-        }
-        let lock_time = Instant::now();
-        self.tree_map.insert(key.clone(), item);
         metrics::LOCK_TIME_SECONDS.with_label_values(&["set", "tree_map", "write"]).inc_by(lock_time.elapsed().as_secs_f64());
-        metrics::LOCK_COUNT.with_label_values(&["set", "tree_map", "write"]).inc();
 
-        metrics::TREE_MAP_ITEM_COUNT.with_label_values(&[&String::from_utf8_lossy(prefix)]).inc();
+        // Acquire write lock on the TreeItem and perform the update.
+        // The same logic handles both new (placeholder) and existing items,
+        // since a placeholder looks like a "deleted" item.
+        let (new_rev, key_for_watchers, value_for_watchers, old_value) = {
+            let mut existing_item = item_arc.write().unwrap();
 
-        self.notify_watchers(&key, value_for_watchers, None, prefix).await;
+            if existing_item.latest_value.value.is_some() {
+                // Item is not deleted - check compare constraints
+                let cmp = required.as_ref().map(|r| r.compare_result).unwrap_or(0);
+                let cmp_satisfied = |existing: i64, target: i64| -> bool {
+                    match cmp {
+                        1 => existing > target,    // GREATER
+                        2 => existing < target,    // LESS
+                        3 => existing != target,   // NOT_EQUAL
+                        _ => existing == target,   // EQUAL (default)
+                    }
+                };
+                if (required_last_revision >= 0
+                    && !cmp_satisfied(existing_item.latest_value.mod_revision, required_last_revision))
+                    || (required_version >= 0
+                        && !cmp_satisfied(existing_item.latest_value.version, required_version))
+                {
+                    // failed to update because the mod_revision does not match
+                    return Err((
+                        latest_rev,
+                        Some(Self::as_mvcc_key_value(
+                            existing_item.latest_value.clone(),
+                            &existing_item.key,
+                        )),
+                    ));
+                }
+            } else {
+                // Item has been deleted or is new
+                if required_last_revision > 0 || required_version > 0 {
+                    // This item does not exist, so anything but 0 for required version or rev is an error
+                    return Err((latest_rev, None));
+                }
+                if value.is_none() {
+                    // trying to delete a non-existent key
+                    return Err((latest_rev, None));
+                }
+            }
+
+            // see if we should filter out revisions that have been compacted
+            let earliest_revision = self.values_by_revision.earliest_revision() as i64;
+            if existing_item.revisions.first().unwrap_or(&earliest_revision)
+                < &earliest_revision
+            {
+                let earliest_idx = existing_item
+                    .revisions
+                    .partition_point(|v| v < &earliest_revision);
+                existing_item.revisions.drain(..earliest_idx);
+            }
+
+            // The placeholder value is temporary, it gets modified and re-set once we have the revision number
+            let new_rev = self.values_by_revision.push(placeholder_value) as i64 + 1;
+
+            metrics::TREE_MAP_SIZE_BYTES.add(value.as_ref().map(|v| v.len() as i64).unwrap_or(0));
+            let mut new_value = Value {
+                create_revision: 0,
+                mod_revision: new_rev,
+                version: 0,
+                value: value
+            };
+            if existing_item.latest_value.value.is_some() {
+                // Modifying an existing item
+                new_value.create_revision = existing_item.latest_value.create_revision;
+                new_value.version = existing_item.latest_value.version + 1;
+            } else {
+                // New item (was deleted or just created as placeholder)
+                new_value.create_revision = new_rev;
+                new_value.version = 1;
+            }
+
+            // For new items, there is no previous value to report
+            let old_value = if is_new_item {
+                None
+            } else {
+                Some(existing_item.latest_value.clone())
+            };
+
+            existing_item.latest_value = new_value;
+
+            let key_for_watchers = existing_item.key.clone();
+            let value_for_watchers = existing_item.latest_value.clone();
+
+            self.values_by_revision
+                .set(new_rev as usize - 1, existing_item.latest_value.clone());
+            existing_item.revisions.push(new_rev);
+
+            (new_rev, key_for_watchers, value_for_watchers, old_value)
+        }; // guard dropped here
+
+        self.notify_watchers(&key_for_watchers, value_for_watchers, old_value, prefix).await;
 
         Ok(new_rev)
     }
@@ -553,9 +542,9 @@ impl Store {
             } = job;
 
             if let Some(wal) = wal {
-                // TODO: some potential confusion between empty value and deleted value
-                // What we want is value == None for deleted values and value.length == 0 for empty values
-                let v = if msg.kv.value.is_empty() { None } else { Some(msg.kv.value.as_ref()) };
+                // Use version == 0 to detect deletes (same as F4 fix in watch_service.rs)
+                // version == 0 means deleted, value.is_empty() could be a valid empty-value PUT
+                let v = if msg.kv.version == 0 { None } else { Some(msg.kv.value.as_ref()) };
                 wal.append(prefix_str.as_bytes(), rev, msg.kv.key.as_slice(), v, wal_handled);
             }
 
@@ -583,11 +572,10 @@ impl Store {
                         metrics::WATCH_RESPONSE_CLOSED_COUNT.with_label_values(&[&prefix_str]).inc();
                         continue;
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(msg_back)) => {
-                        let start = Instant::now();
-                        let _ = ch.blocking_send(msg_back);
-                        let elapsed = start.elapsed();
-                        metrics::WATCH_RESPONSE_BLOCKING_TIME_SECONDS.with_label_values(&[&prefix_str]).inc_by(elapsed.as_secs_f64());
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_msg_back)) => {
+                        // Drop the message instead of blocking the notification thread.
+                        // A slow watcher should not block notifications to other watchers.
+                        log::warn!("Watcher channel full, dropping event for prefix {}", prefix_str);
                         metrics::WATCH_RESPONSE_BLOCKING_COUNT.with_label_values(&[&prefix_str]).inc();
                     }
                 }
@@ -640,6 +628,10 @@ impl Store {
             let i = Included(start_suffix.to_vec());
             return Ok((start_prefix, (i.clone(), i)));
         }
+        // etcd convention: range_end = "\0" means all keys >= start
+        if end.len() == 1 && end[0] == 0 {
+            return Ok((start_prefix, (Included(start_suffix.to_vec()), Unbounded)));
+        }
         let (end_prefix, end_suffix) = Self::prefix_split(end);
         if start_prefix != end_prefix {
             // A common pattern is to go prefix /a/b/c/ and end /a/b/c0, which is excluded so it
@@ -651,7 +643,8 @@ impl Store {
             // end_suffix == "c0"
             if !end_suffix.is_empty() {
                 let end_suffix_without_last = &end_suffix[..end_suffix.len() - 1];
-                if end_suffix.last() == Some(&b'0')
+                // Check for both Kubernetes '0' (0x30) and etcd '\0' (0x00) conventions
+                if (end_suffix.last() == Some(&b'0') || end_suffix.last() == Some(&0u8))
                     && start_prefix == [end_prefix, end_suffix_without_last, b"/"].concat()
                 {
                     return Ok((start_prefix, (Included(start_suffix.to_vec()), Unbounded)));
@@ -674,6 +667,14 @@ impl Store {
                         String::from_utf8_lossy(end_prefix)
                     ),
                 ));
+            }
+        }
+        // Also check for etcd \0 suffix convention: end = start_prefix + start_suffix + "\0"
+        // means all keys with the given prefix
+        if end_suffix.last() == Some(&0u8) && end_suffix.len() >= 1 {
+            let end_suffix_without_last = &end_suffix[..end_suffix.len() - 1];
+            if end_suffix_without_last == start_suffix {
+                return Ok((start_prefix, (Included(start_suffix.to_vec()), Unbounded)));
             }
         }
         return Ok((
@@ -738,7 +739,11 @@ impl Store {
             for (key, item) in prefix_map_item.btree.range(range) {
                 if count > limit {
                     // It seems to be ok if this is an estimate, as long as count is larger than limit
-                    count += 1;
+                    // But we should still check if the key has a value to avoid counting deleted keys
+                    let item_guard = item.read().unwrap();
+                    if self.has_value_for_revision(&item_guard, rev) {
+                        count += 1;
+                    }
                     continue;
                 }
 
@@ -976,6 +981,85 @@ impl Store {
     pub fn progress_revision(&self) -> i64 {
         self.progress_rev.load(Ordering::SeqCst)
     }
+
+    /// Export all key-value pairs for Raft snapshotting.
+    /// Returns (key, value_bytes, create_revision, mod_revision, version) tuples.
+    pub fn export_snapshot_data(&self) -> Vec<(Vec<u8>, Vec<u8>, i64, i64, i64)> {
+        self.tree_map.iter()
+            .filter_map(|entry| {
+                let item = entry.value().read().unwrap();
+                if item.latest_value.value.is_some() {
+                    Some((
+                        entry.key().clone(),
+                        item.latest_value.value.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
+                        item.latest_value.create_revision,
+                        item.latest_value.mod_revision,
+                        item.latest_value.version,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Import key-value pairs from a Raft snapshot.
+    /// Replaces all existing data with the snapshot data.
+    pub fn import_snapshot_data(&self, entries: Vec<(Vec<u8>, Vec<u8>, i64, i64, i64)>) {
+        // Clear existing data including values_by_revision
+        self.prefix_map.clear();
+        self.tree_map.clear();
+        self.values_by_revision.clear();
+
+        // Find the max mod_revision to know how many slots we need in values_by_revision
+        let max_mod_rev = entries.iter().map(|(_, _, _, mod_rev, _)| *mod_rev).max().unwrap_or(0);
+
+        // Populate values_by_revision with placeholder values up to max_mod_rev
+        // so that find_value_for_revision and current_revision() work correctly
+        let placeholder = Value {
+            create_revision: 0,
+            mod_revision: 0,
+            version: 0,
+            value: None,
+        };
+        for _ in 0..max_mod_rev {
+            self.values_by_revision.push(placeholder.clone());
+        }
+
+        for (key, value, create_revision, mod_revision, version) in entries {
+            let (prefix, suffix) = Self::prefix_split(&key);
+
+            let value_len = value.len();
+            let val = Value {
+                create_revision,
+                mod_revision,
+                version,
+                value: Some(Bytes::from(value)),
+            };
+
+            // Set the value in values_by_revision at the correct index
+            self.values_by_revision.set(mod_revision as usize - 1, val.clone());
+            metrics::TREE_MAP_SIZE_BYTES.add(value_len as i64);
+
+            let item = TreeItem {
+                key: key.clone(),
+                revisions: vec![mod_revision],
+                latest_value: val,
+            };
+
+            let item = Arc::new(RwLock::new(item));
+
+            // Insert into prefix_map
+            let mut prefix_item = self.prefix_map
+                .entry(prefix.to_vec())
+                .or_insert_with(|| PrefixMapItem { btree: BTreeMap::new() });
+            prefix_item.btree.insert(suffix.to_vec(), item.clone());
+            drop(prefix_item);
+
+            // Insert into tree_map
+            self.tree_map.insert(key, item);
+        }
+    }
 }
 
 pub struct AlertingHistogramTimer<'a> {
@@ -999,7 +1083,7 @@ impl<'a> Drop for AlertingHistogramTimer<'a> {
     fn drop(&mut self) {
         let v = self.start.elapsed();
         if v > std::time::Duration::from_millis(100) {
-            println!("AlertingHistogramTimer: {} seconds for {}", v.as_secs_f32(), (self.name_fn)());
+            log::warn!("AlertingHistogramTimer: {} seconds for {}", v.as_secs_f32(), (self.name_fn)());
         }
     }
 }

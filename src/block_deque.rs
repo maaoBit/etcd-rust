@@ -235,6 +235,14 @@ where
         self.start_offset.store(idx, Ordering::Release);
         Ok(())
     }
+
+    /// Clear all data and reset to empty state.
+    pub fn clear(&self) {
+        let mut blocks_write = self.blocks.write().unwrap();
+        blocks_write.clear();
+        self.start_offset.store(0, Ordering::Release);
+        self.length.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(test)]

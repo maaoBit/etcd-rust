@@ -99,7 +99,9 @@ impl WalManager {
                         // is already writing
                         continue;
                     }
-                    writer.write_locked().unwrap();
+                    if let Err(e) = writer.write_locked() {
+                        log::error!("WAL write failed: {}", e);
+                    }
                     writer.is_writing.store(false, std::sync::atomic::Ordering::SeqCst);
                     if !writer.to_write_rx.is_empty() {
                         // if writer didn't write everything there is still more work to do
@@ -189,72 +191,58 @@ impl PerPrefixWriter {
     }
 
     fn write_locked(&self) -> std::io::Result<()> {
-        // TODO: change based on mode
-        // TODO: maybe use deadlines based on enqueue time
         let end_time = std::time::Instant::now() + std::time::Duration::from_micros(500);
         let end_size = 16384;
 
         let mut current_size = 0;
-        let mut iovs_vec: Vec<libc::iovec> = Vec::with_capacity(16);
+        let mut buffer: Vec<u8> = Vec::with_capacity(end_size);
         let mut notify_vec: Vec<Arc<Notify>> = Vec::with_capacity(16);
 
-        // Batch up things to write
+        // Batch up records into a single contiguous buffer to avoid use-after-free
+        // (the old writev approach had dangling pointers after each loop iteration)
         while current_size < end_size && std::time::Instant::now() < end_time {
             let mut rec = match self.to_write_rx.recv_deadline(end_time) {
                 Ok(rec) => rec,
                 Err(_) => break,
             };
 
-            // Build header and iovecs from provided slices
-            let key_bytes: &[u8] = &rec.key;
-            let val_opt: Option<&[u8]> = rec.value.as_deref();
-            let key_len = key_bytes.len() as u32;
-            let value_len = val_opt.map(|v| v.len() as u32).unwrap_or(WalRecord::DELETE_MARKER);
+            let key_len = rec.key.len() as u32;
+            let value_len = rec.value.as_ref().map(|v| v.len() as u32).unwrap_or(WalRecord::DELETE_MARKER);
+
             let mut header = [0u8; 16];
             header[0..8].copy_from_slice(&(rec.rev as u64).to_le_bytes());
             header[8..12].copy_from_slice(&key_len.to_le_bytes());
             header[12..16].copy_from_slice(&value_len.to_le_bytes());
 
-            let iov0 = libc::iovec { iov_base: header.as_ptr() as *mut _, iov_len: header.len() };
-            let iov1 = if key_len > 0 { Some(libc::iovec { iov_base: key_bytes.as_ptr() as *mut _, iov_len: key_bytes.len() }) } else { None };
-            let iov2 = match val_opt { Some(v) if !v.is_empty() => Some(libc::iovec { iov_base: v.as_ptr() as *mut _, iov_len: v.len() }), _ => None };
-            iovs_vec.push(iov0);
-            if let Some(k) = iov1 { iovs_vec.push(k); }
-            if let Some(v) = iov2 { iovs_vec.push(v); }
+            buffer.extend_from_slice(&header);
+            buffer.extend_from_slice(&rec.key);
+            if let Some(ref v) = rec.value {
+                buffer.extend_from_slice(v);
+            }
 
-            current_size += rec.key.len() + rec.value.as_ref().map_or(0, |v| v.len()) + 16; // 16 is header size
+            current_size += rec.key.len() + rec.value.as_ref().map_or(0, |v| v.len()) + 16;
 
             if let Some(notify) = rec.written_notify.take() {
                 notify_vec.push(notify);
             }
         }
 
-        let mut remaining = current_size;
-        let mut iovs_offset = 0;
-        while remaining > 0 {
-            let res = unsafe { libc::writev(self.fd, iovs_vec.as_ptr().add(iovs_offset), (iovs_vec.len() - iovs_offset) as i32) };
+        // Write the contiguous buffer in a single syscall (or retry on partial write)
+        let mut written = 0;
+        while written < buffer.len() {
+            let res = unsafe { libc::write(self.fd, buffer.as_ptr().add(written) as *const libc::c_void, buffer.len() - written) };
             if res < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted { continue; }
+                // Notify all waiters before returning error so they don't hang forever
+                for notify in &notify_vec {
+                    notify.notify_one();
+                }
                 return Err(err);
             }
-            let mut wrote = res as usize;
-            remaining -= wrote;
-            if remaining == 0 {
-                // Most common that we wrote everything
-                break;
-            }
-            while wrote > 0 {
-                if wrote >= iovs_vec[iovs_offset].iov_len as usize {
-                    wrote -= iovs_vec[iovs_offset].iov_len as usize;
-                    iovs_offset += 1;
-                } else {
-                    iovs_vec[iovs_offset].iov_len -= wrote;
-                    iovs_vec[iovs_offset].iov_base = unsafe { (iovs_vec[iovs_offset].iov_base as *mut u8).add(wrote) } as *mut _;
-                    wrote = 0;
-                }
-            }
+            written += res as usize;
         }
+
         if self.mode == WalMode::Sync {
             unsafe { libc::fsync(self.fd); }
         }

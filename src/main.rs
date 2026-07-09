@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 metrics::COMPACTED_REVISION_COUNT.set(store.compacted_revision() as i64);
                 metrics::WATCHER_COUNT.set(store.watcher_count());
                 let raft_metrics = raft.metrics().borrow().clone();
-                println!("raft_state: node_id={} leader={:?} term={} state={:?}",
+                log::debug!("raft_state: node_id={} leader={:?} term={} state={:?}",
                     raft_metrics.id, raft_metrics.current_leader, raft_metrics.current_term, raft_metrics.state);
                 let metric_families = prometheus::gather();
                 let mut buf = Vec::new();
