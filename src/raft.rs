@@ -8,13 +8,15 @@ use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock as StdRwLock;
 
 use bytes::Bytes;
 use openraft::storage::{LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{BasicNode, Config, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, OptionalSend, Raft, RaftTypeConfig, Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote};
+use openraft::{BasicNode, Config, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, OptionalSend, Raft, Snapshot, SnapshotMeta, StorageError, StoredMembership, Vote};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::membership::{ClusterState, Member};
 use crate::store::Store;
 
 // ── Type Configuration ───────────────────────────────────────────────────
@@ -26,6 +28,17 @@ pub type NodeId = u64;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RaftRequest {
     Set { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+    MemberAdd { peer_urls: Vec<String>, is_learner: bool, member_id: u64 },
+    MemberRemove { id: u64 },
+    MemberUpdate { id: u64, peer_urls: Vec<String>, client_urls: Vec<String> },
+    MemberPromote { id: u64 },
+    Txn { ops: Vec<TxnOp> },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum TxnOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
 }
 
@@ -149,11 +162,12 @@ impl RaftLogStorage<TypeConfig> for MemLogStore {
 // ── State Machine Store (wraps mem_etcd Store) ────────────────────────────
 
 /// Raft state machine that applies entries to the existing mem_etcd Store.
-/// Also tracks Raft metadata (last_applied_log, last_membership, snapshot).
+/// Also tracks Raft metadata (last_applied_log, last_membership, cluster_state, snapshot).
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 struct StateMachineData {
     last_applied_log: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
+    cluster_state: ClusterState,
 }
 
 #[derive(Debug)]
@@ -169,6 +183,8 @@ pub struct StateMachineStore {
     sm: RwLock<StateMachineData>,
     snapshot_idx: AtomicU64,
     current_snapshot: RwLock<Option<StoredSnapshot>>,
+    /// Shared cluster membership state (replicated through Raft)
+    cluster_state: Arc<StdRwLock<ClusterState>>,
 }
 
 impl StateMachineStore {
@@ -178,7 +194,23 @@ impl StateMachineStore {
             sm: RwLock::new(StateMachineData::default()),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: RwLock::new(None),
+            cluster_state: Arc::new(StdRwLock::new(ClusterState::default())),
         }
+    }
+
+    pub fn new_with_cluster_state(store: Arc<Store>, cluster_state: Arc<StdRwLock<ClusterState>>) -> Self {
+        Self {
+            store,
+            sm: RwLock::new(StateMachineData::default()),
+            snapshot_idx: AtomicU64::new(0),
+            current_snapshot: RwLock::new(None),
+            cluster_state,
+        }
+    }
+
+    /// Get a reference to the shared cluster state.
+    pub fn cluster_state(&self) -> Arc<StdRwLock<ClusterState>> {
+        self.cluster_state.clone()
     }
 }
 
@@ -267,6 +299,85 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
                                 Err((rev, _)) => rev,
                             }
                         }
+                        RaftRequest::MemberAdd { peer_urls, is_learner, member_id } => {
+                            let member = Member {
+                                id: *member_id,
+                                name: String::new(),
+                                peer_urls: peer_urls.clone(),
+                                client_urls: vec![],
+                                is_learner: *is_learner,
+                            };
+                            // Update the shared cluster state
+                            if let Ok(mut cs) = self.cluster_state.write() {
+                                cs.members.push(member.clone());
+                            }
+                            // Update the snapshot-tracked state
+                            sm.cluster_state.members.push(member);
+                            self.store.current_revision()
+                        }
+                        RaftRequest::MemberRemove { id } => {
+                            let member = {
+                                let mut cs = self.cluster_state.write().unwrap();
+                                let pos = cs.members.iter().position(|m| m.id == *id);
+                                pos.map(|p| cs.members.remove(p))
+                            };
+                            if let Some(m) = member {
+                                let mut cs = self.cluster_state.write().unwrap();
+                                cs.removed.push(m.id);
+                                sm.cluster_state.members.retain(|m| m.id != *id);
+                                sm.cluster_state.removed.push(*id);
+                            }
+                            self.store.current_revision()
+                        }
+                        RaftRequest::MemberUpdate { id, peer_urls, client_urls } => {
+                            if let Ok(mut cs) = self.cluster_state.write() {
+                                if let Some(member) = cs.members.iter_mut().find(|m| m.id == *id) {
+                                    member.peer_urls = peer_urls.clone();
+                                    member.client_urls = client_urls.clone();
+                                }
+                            }
+                            if let Some(member) = sm.cluster_state.members.iter_mut().find(|m| m.id == *id) {
+                                member.peer_urls = peer_urls.clone();
+                                member.client_urls = client_urls.clone();
+                            }
+                            self.store.current_revision()
+                        }
+                        RaftRequest::MemberPromote { id } => {
+                            if let Ok(mut cs) = self.cluster_state.write() {
+                                if let Some(member) = cs.members.iter_mut().find(|m| m.id == *id) {
+                                    member.is_learner = false;
+                                }
+                            }
+                            if let Some(member) = sm.cluster_state.members.iter_mut().find(|m| m.id == *id) {
+                                member.is_learner = false;
+                            }
+                            self.store.current_revision()
+                        }
+                        RaftRequest::Txn { ops } => {
+                            let mut rev = self.store.current_revision();
+                            for op in ops {
+                                match op {
+                                    TxnOp::Put { key, value } => {
+                                        let val = if value.is_empty() {
+                                            Some(Bytes::new())
+                                        } else {
+                                            Some(Bytes::from(value.clone()))
+                                        };
+                                        match self.store.set(key.clone(), val, None).await {
+                                            Ok(r) => rev = r,
+                                            Err((r, _)) => rev = r,
+                                        }
+                                    }
+                                    TxnOp::Delete { key } => {
+                                        match self.store.set(key.clone(), None, None).await {
+                                            Ok(r) => rev = r,
+                                            Err((r, _)) => rev = r,
+                                        }
+                                    }
+                                }
+                            }
+                            rev
+                        }
                     };
                     RaftResponse { revision: rev }
                 }
@@ -312,6 +423,12 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         let mut sm = self.sm.write().await;
         sm.last_applied_log = recovered.last_applied_log;
         sm.last_membership = recovered.last_membership;
+        sm.cluster_state = recovered.cluster_state.clone();
+
+        // Sync shared cluster state from recovered snapshot
+        if let Ok(mut cs) = self.cluster_state.write() {
+            *cs = recovered.cluster_state;
+        }
 
         *self.current_snapshot.write().await = Some(new_snapshot);
         Ok(())
@@ -900,7 +1017,8 @@ pub async fn create_grpc_raft_node(
     id: NodeId,
     peers: Vec<(NodeId, String)>,
     store: Arc<Store>,
-) -> Result<(RaftNode, RaftGrpcService), Box<dyn std::error::Error>> {
+    cluster_state: Option<Arc<StdRwLock<ClusterState>>>,
+) -> Result<(RaftNode, RaftGrpcService, Arc<StateMachineStore>), Box<dyn std::error::Error>> {
     let config = Arc::new(
         Config {
             heartbeat_interval: 250,
@@ -912,13 +1030,16 @@ pub async fn create_grpc_raft_node(
     );
 
     let log_store = MemLogStore::default();
-    let sm_store = Arc::new(StateMachineStore::new(store.clone()));
+    let sm_store = Arc::new(match cluster_state {
+        Some(cs) => StateMachineStore::new_with_cluster_state(store.clone(), cs),
+        None => StateMachineStore::new(store.clone()),
+    });
     let router = GrpcRouter::new(peers);
 
-    let raft = Raft::new(id, config, router, log_store, sm_store).await?;
+    let raft = Raft::new(id, config, router, log_store, sm_store.clone()).await?;
     let grpc_service = RaftGrpcService::new(raft.clone());
 
-    Ok((raft, grpc_service))
+    Ok((raft, grpc_service, sm_store))
 }
 
 /// Initialize a cluster with gRPC-addressed peers.

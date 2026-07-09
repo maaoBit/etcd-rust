@@ -13,12 +13,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         includes.push((*inc).into());
     }
 
-    // Build etcd API protos (server only)
+    // Build etcd API protos (server only) + election + lock
     tonic_build::configure()
         .build_client(false)
         .build_server(true)
         .bytes(&["KeyValue.value"])
-        .compile_protos(&["extern/etcd/api/rpc.proto"], &includes)?;
+        .compile_protos(&[
+            "extern/etcd/api/rpc.proto",
+            "proto/election.proto",
+            "proto/lock.proto",
+        ], &includes)?;
 
     // Build Raft transport proto (both client and server)
     tonic_build::configure()
