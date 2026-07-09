@@ -1,2 +1,22 @@
-mem_etcd
+# Build artifacts
 target/
+
+# Binaries
+/mem_etcd
+/stress_client
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go (porcupine test)
+tests/porcupine-test/go.sum
+
+# WAL data (runtime)
+wal/
