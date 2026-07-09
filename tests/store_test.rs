@@ -18,7 +18,7 @@ macro_rules! as_bytes {
 async fn test_range_revision() {
     let s = Store::new(None);
     let rev = s.set(b"foo".to_vec(), Some(as_bytes!(b"bar")),
-        Some(SetRequired{required_last_revision: Some(0), required_version: None})).await.unwrap();
+        Some(SetRequired{required_last_revision: Some(0), required_version: None, compare_result: 0})).await.unwrap();
     assert_eq!(rev, 1, "unexpected revision");
 
     let RangeResult { kvs, latest_rev: rev, .. } = s.range(b"foo".to_vec(), b"".to_vec(), 0, None).unwrap();
@@ -150,7 +150,7 @@ async fn test_set_txn_revision() {
     let rev = set_with_revision!(s, b"foo", b"r3", None);
     assert_eq!(rev, 3, "unexpected revision");
 
-    let (rev, _val) = s.set(b"foo".to_vec(), Some(as_bytes!(b"r4")), Some(SetRequired{required_last_revision: Some(1), required_version: None})).await.unwrap_err();
+    let (rev, _val) = s.set(b"foo".to_vec(), Some(as_bytes!(b"r4")), Some(SetRequired{required_last_revision: Some(1), required_version: None, compare_result: 0})).await.unwrap_err();
     assert_eq!(rev, 3, "unexpected revision");
 
     let RangeResult { kvs, .. } = s.range(b"foo".to_vec(), b"".to_vec(), 0, None).unwrap();
@@ -174,7 +174,7 @@ async fn test_set_txn_version() {
     assert_eq!(rev, 4, "unexpected revision");
 
     // Set with required version == 1 should fail
-    let (rev, _val) = s.set(b"foo".to_vec(), Some(as_bytes!(b"r5")), Some(SetRequired{required_last_revision: None, required_version: Some(1)})).await.unwrap_err();
+    let (rev, _val) = s.set(b"foo".to_vec(), Some(as_bytes!(b"r5")), Some(SetRequired{required_last_revision: None, required_version: Some(1), compare_result: 0})).await.unwrap_err();
     assert_eq!(rev, 4, "unexpected revision");
 
     // Delete the key, then set with required version 0 should work
@@ -229,14 +229,14 @@ async fn test_delete_revision() {
     set_with_revision!(s, b"a", b"r1", None);
     set_with_revision!(s, b"a", b"r2", None);
 
-    let (rev, v) = s.delete(b"a".to_vec(), Some(SetRequired{required_last_revision: Some(1), required_version: None})).await.unwrap_err();
+    let (rev, v) = s.delete(b"a".to_vec(), Some(SetRequired{required_last_revision: Some(1), required_version: None, compare_result: 0})).await.unwrap_err();
     assert_eq!(rev, 2, "unexpected revision");
     assert!(
         v.is_some(),
         "Expected Delete to fail and value to be returned"
     );
 
-    let rev = s.delete(b"a".to_vec(), Some(SetRequired{required_last_revision: Some(2), required_version: None})).await.unwrap();
+    let rev = s.delete(b"a".to_vec(), Some(SetRequired{required_last_revision: Some(2), required_version: None, compare_result: 0})).await.unwrap();
     assert_eq!(rev, 3, "unexpected revision");
 }
 

@@ -97,6 +97,7 @@ impl Watch for WatchService {
             };
 
             // If there are past changes, we send them next
+            let max_past_rev = past_changes.last().map(|c| c.kv.mod_revision).unwrap_or(0);
             if !past_changes.is_empty() {
                 yield WatchResponse {
                     header: Some(ResponseHeader {
@@ -124,7 +125,6 @@ impl Watch for WatchService {
             // Compute max revision from past changes for deduplication.
             // Events from the watcher channel with mod_revision <= this value
             // are duplicates (already sent in past_changes) and should be skipped.
-            let max_past_rev = past_changes.last().map(|c| c.kv.mod_revision).unwrap_or(0);
             max_event_stream_rev = max_past_rev;
             loop {
                 let mut read_many = Vec::with_capacity(100);

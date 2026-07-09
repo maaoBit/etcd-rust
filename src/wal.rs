@@ -159,7 +159,12 @@ impl PerPrefixWriter {
             .create(true)
             .read(true)
             .append(true)
-            .custom_flags(libc::O_NOATIME | libc::O_CLOEXEC)
+            .custom_flags({
+                #[cfg(target_os = "linux")]
+                { libc::O_NOATIME | libc::O_CLOEXEC }
+                #[cfg(not(target_os = "linux"))]
+                { libc::O_CLOEXEC }
+            })
             .open(&path)?;
         let fd = file.as_raw_fd();
         std::mem::forget(file); // Keep FD open; File would close on drop

@@ -2,6 +2,7 @@
 // Copyright 2025 Benjamin Chess
 pub mod block_deque;
 pub mod kv_service;
+pub mod raft;
 pub mod store;
 pub mod wal;
 mod metrics;

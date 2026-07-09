@@ -7,17 +7,50 @@ use crate::etcdserverpb::{
     PutResponse, RangeRequest, RangeResponse, ResponseHeader, TxnRequest, TxnResponse,
 };
 use crate::mvccpb::KeyValue;
+use crate::raft::{RaftNode, RaftRequest};
 use crate::store::{SetRequired, Store};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use bytes::Bytes;
+
 pub struct KvService {
     store: Arc<Store>,
+    raft: Option<RaftNode>,
 }
 
 impl KvService {
     pub fn new(store: Arc<Store>) -> Self {
-        KvService { store }
+        KvService { store, raft: None }
+    }
+
+    /// Create KvService with Raft enabled. Writes go through Raft.
+    pub fn with_raft(store: Arc<Store>, raft: RaftNode) -> Self {
+        KvService { store, raft: Some(raft) }
+    }
+
+    /// Check if this node is the Raft leader. Returns error if not.
+    fn ensure_leader(&self) -> Result<(), Status> {
+        if let Some(ref raft) = self.raft {
+            let metrics = raft.metrics().borrow().clone();
+            let node_id = metrics.id;
+            match metrics.current_leader {
+                Some(leader) if leader == node_id => Ok(()),
+                Some(leader) => Err(Status::failed_precondition(
+                    format!("not leader, current leader is node {}", leader)
+                )),
+                None => Err(Status::unavailable("no leader elected")),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Propose a write through Raft and return the revision.
+    async fn raft_write(&self, req: RaftRequest) -> Result<i64, Status> {
+        let raft = self.raft.as_ref().unwrap();
+        let resp = raft.client_write(req).await
+            .map_err(|e| Status::internal(format!("raft write failed: {:?}", e)))?;
+        Ok(resp.data.revision)
     }
 }
 
@@ -87,15 +120,24 @@ impl Kv for KvService {
                 None => return Err(Status::invalid_argument("ignore_value set but key does not exist")),
             }
         } else {
-            Some(Bytes::from(req.value))
+            Some(Bytes::from(req.value.clone()))
         };
 
-        // Perform the put operation on the store
-        let rev = self
-            .store
-            .set(req.key, value, None)
-            .await
-            .map_err(|e| Status::internal(format!("Put operation failed: {:?}", e)))?;
+        // Perform the put operation
+        let rev = if self.raft.is_some() {
+            // Raft mode: propose through consensus
+            self.ensure_leader()?;
+            self.raft_write(RaftRequest::Set {
+                key: req.key.clone(),
+                value: req.value.clone(),
+            }).await?
+        } else {
+            // Single-node mode: write directly
+            self.store
+                .set(req.key, value, None)
+                .await
+                .map_err(|e| Status::internal(format!("Put operation failed: {:?}", e)))?
+        };
 
         // Construct the PutResponse
         let response = PutResponse {
@@ -129,33 +171,31 @@ impl Kv for KvService {
             None
         };
 
-        match self.store.delete(req.key, None).await {
-            Ok(rev) => {
-                Ok(Response::new(DeleteRangeResponse {
-                    prev_kvs: if req.prev_kv { prev_kv.map(|kv| vec![kv]).unwrap_or_default() } else { Vec::new() },
-                    deleted: 1,
-                    header: Some(ResponseHeader {
-                        cluster_id: 0,
-                        member_id: 0,
-                        raft_term: 0,
-                        revision: rev,
-                    }),
-                }))
+        let rev = if self.raft.is_some() {
+            // Raft mode: propose through consensus
+            self.ensure_leader()?;
+            self.raft_write(RaftRequest::Delete {
+                key: req.key.clone(),
+            }).await?
+        } else {
+            // Single-node mode
+            match self.store.delete(req.key, None).await {
+                Ok(rev) => rev,
+                Err((rev, _)) => rev,
             }
-            Err((rev, _)) => {
-                // Key doesn't exist — etcd returns success with deleted: 0
-                Ok(Response::new(DeleteRangeResponse {
-                    prev_kvs: Vec::new(),
-                    deleted: 0,
-                    header: Some(ResponseHeader {
-                        cluster_id: 0,
-                        member_id: 0,
-                        raft_term: 0,
-                        revision: rev,
-                    }),
-                }))
-            }
-        }
+        };
+
+        let deleted = if prev_kv.is_some() { 1 } else { 0 };
+        Ok(Response::new(DeleteRangeResponse {
+            prev_kvs: if req.prev_kv { prev_kv.map(|kv| vec![kv]).unwrap_or_default() } else { Vec::new() },
+            deleted,
+            header: Some(ResponseHeader {
+                cluster_id: 0,
+                member_id: 0,
+                raft_term: 0,
+                revision: rev,
+            }),
+        }))
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {

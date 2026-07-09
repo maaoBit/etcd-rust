@@ -4,6 +4,7 @@ mod block_deque;
 mod kv_service;
 mod lease_service;
 mod metrics;
+mod raft;
 mod store;
 mod watch_service;
 mod wal;
@@ -34,8 +35,6 @@ use axum::{
     Router,
 };
 
-// use watch_service::WatchService;
-
 mod authpb {
     tonic::include_proto!("authpb");
 }
@@ -58,9 +57,9 @@ impl From<CliWalMode> for crate::wal::WalMode {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "mem_etcd", version, about = "In-memory etcd-like server", long_about = None)]
+#[command(name = "mem_etcd", version, about = "In-memory etcd-like server with optional Raft", long_about = None)]
 struct Cli {
-    /// gRPC listen port
+    /// gRPC listen port (etcd API + Raft transport)
     #[arg(long = "port", env = "ETCD_PORT", default_value_t = 2379)]
     port: u16,
 
@@ -78,6 +77,24 @@ struct Cli {
 
     #[arg(long = "wal-no-write-prefix", value_parser, num_args = 0.., value_delimiter = ' ')]
     wal_no_write_prefixes: Vec<String>,
+
+    // ── Raft configuration ──
+
+    /// Enable Raft consensus mode
+    #[arg(long = "raft-enabled", env = "RAFT_ENABLED", default_value_t = false)]
+    raft_enabled: bool,
+
+    /// This node's Raft ID (1-based)
+    #[arg(long = "raft-node-id", env = "RAFT_NODE_ID")]
+    raft_node_id: Option<u64>,
+
+    /// Peer list: "1@host:port,2@host:port,3@host:port"
+    #[arg(long = "raft-peers", env = "RAFT_PEERS")]
+    raft_peers: Option<String>,
+
+    /// Initialize the cluster (only first node should use this)
+    #[arg(long = "raft-init", env = "RAFT_INIT", default_value_t = false)]
+    raft_init: bool,
 }
 
 #[tokio::main]
@@ -89,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wal_settings = Some(store::WalSettings {
         wal_dir: cli.wal_dir.clone(),
         default_mode: cli.wal_default.into(),
-        load_wal_dir: true,
+        load_wal_dir: !cli.raft_enabled, // Don't load WAL in raft mode (raft log is the source of truth)
         prefix_modes_no_persist: {
             let set = DashSet::new();
             for prefix in cli.wal_no_write_prefixes.into_iter() {
@@ -103,55 +120,144 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // etcd initializes with rev at 1, so set a dummy key to take rev 0
     store.set(b"~".to_vec(), Some(Bytes::from(b"".to_vec())), None).await.unwrap();
 
-    let kv_service = KvServer::new(KvService::new(Arc::clone(&store)));
-    let maintenance_service = MaintenanceServer::new(MaintenanceService::new(Arc::clone(&store)));
-    let watch_service = WatchServer::new(WatchService::new(Arc::clone(&store)));
-    let lease_service = LeaseServer::new(LeaseService::new(Arc::clone(&store)));
+    // ── Optional Raft setup ──
+    let mut raft_node: Option<raft::RaftNode> = None;
 
-    // Build the Axum metrics app
-    let metrics_app = Router::new().route("/metrics", get(move || {
-        let store = Arc::clone(&store);
-        async move {
-            metrics::REVISION_COUNT.set(store.current_revision() as i64);
-            metrics::COMPACTED_REVISION_COUNT.set(store.compacted_revision() as i64);
-            metrics::WATCHER_COUNT.set(store.watcher_count());
+    if cli.raft_enabled {
+        let node_id = cli.raft_node_id.ok_or("--raft-node-id is required when --raft-enabled")?;
+        let peers_str = cli.raft_peers.as_deref().ok_or("--raft-peers is required when --raft-enabled")?;
+        let peers = raft::parse_peers(peers_str)?;
 
-            let metric_families = prometheus::gather();
-            let mut buf = Vec::new();
-            let encoder = TextEncoder::new();
-            encoder.encode(&metric_families, &mut buf).unwrap();
-            String::from_utf8(buf).unwrap()
+        let (raft, grpc_service) = raft::create_grpc_raft_node(node_id, peers.clone(), store.clone()).await?;
+        raft_node = Some(raft.clone());
+
+        // Spawn cluster initialization after gRPC server starts
+        if cli.raft_init {
+            let raft_clone = raft.clone();
+            let peers_clone = peers.clone();
+            tokio::spawn(async move {
+                // Wait for gRPC server to be ready on all nodes
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match raft::init_grpc_cluster(&raft_clone, &peers_clone).await {
+                    Ok(_) => println!("Cluster initialized with {} peers", peers_clone.len()),
+                    Err(e) => eprintln!("Cluster init failed: {} (will retry via election)", e),
+                }
+            });
         }
-    }));
 
-    // Bind a listener for the metrics endpoint
-    let metrics_listener = tokio::net::TcpListener::bind(format!("[::]:{}", cli.metrics_port)).await.unwrap();
+        // Leader election will happen after cluster init + gRPC server starts
+        // Check leader status asynchronously
+        {
+            let raft_clone = raft.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                match raft::wait_for_leader_grpc(&raft_clone, std::time::Duration::from_secs(15)).await {
+                    Ok(leader) => {
+                        let metrics = raft_clone.metrics().borrow().clone();
+                        println!("Raft cluster ready. Leader: node {}, term: {}", leader, metrics.current_term);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: no leader elected: {}", e);
+                    }
+                }
+            });
+        }
 
-    // Spawn the metrics server in its own task
-    tokio::spawn(async move {
-        axum::serve(metrics_listener, metrics_app).await.unwrap();
-    });
+        // Build gRPC server with both etcd API and Raft transport services
+        let kv_service = KvServer::new(KvService::with_raft(Arc::clone(&store), raft.clone()));
+        let maintenance_service = MaintenanceServer::new(MaintenanceService::new(Arc::clone(&store)));
+        let watch_service = WatchServer::new(WatchService::new(Arc::clone(&store)));
+        let lease_service = LeaseServer::new(LeaseService::new(Arc::clone(&store)));
+        let raft_service = grpc_service.into_server();
 
+        let (in_flight_requests_layer, in_flight_requests_counter) = InFlightRequestsLayer::pair();
+        tokio::spawn(
+            in_flight_requests_counter.run_emitter(std::time::Duration::from_secs(5), |counter| async move {
+                metrics::IN_FLIGHT_REQUESTS.set(counter as i64);
+            }),
+        );
 
-    let (in_flight_requests_layer, in_flight_requests_counter) = InFlightRequestsLayer::pair();
-    tokio::spawn(
-        in_flight_requests_counter.run_emitter(std::time::Duration::from_secs(5), |counter| async move {
-            metrics::IN_FLIGHT_REQUESTS.set(counter as i64);
-        }),
-    );
+        // Metrics server
+        let metrics_store = Arc::clone(&store);
+        let metrics_raft = raft.clone();
+        let metrics_app = Router::new().route("/metrics", get(move || {
+            let store = Arc::clone(&metrics_store);
+            let raft = metrics_raft.clone();
+            async move {
+                metrics::REVISION_COUNT.set(store.current_revision() as i64);
+                metrics::COMPACTED_REVISION_COUNT.set(store.compacted_revision() as i64);
+                metrics::WATCHER_COUNT.set(store.watcher_count());
+                let raft_metrics = raft.metrics().borrow().clone();
+                println!("raft_state: node_id={} leader={:?} term={} state={:?}",
+                    raft_metrics.id, raft_metrics.current_leader, raft_metrics.current_term, raft_metrics.state);
+                let metric_families = prometheus::gather();
+                let mut buf = Vec::new();
+                let encoder = TextEncoder::new();
+                encoder.encode(&metric_families, &mut buf).unwrap();
+                String::from_utf8(buf).unwrap()
+            }
+        }));
+        let metrics_listener = tokio::net::TcpListener::bind(format!("[::]:{}", cli.metrics_port)).await.unwrap();
+        tokio::spawn(async move {
+            axum::serve(metrics_listener, metrics_app).await.unwrap();
+        });
 
-    // Now run the gRPC server on the main task
-    println!("Starting gRPC server on {}", addr);
-    Server::builder()
-        .max_concurrent_streams(100)
-        .http2_adaptive_window(Some(true))
-        .layer(in_flight_requests_layer)
-        .add_service(kv_service)
-        .add_service(maintenance_service)
-        .add_service(lease_service)
-        .add_service(watch_service)
-        .serve(addr)
-        .await?;
+        println!("Starting gRPC server on {} (Raft mode, node {})", addr, node_id);
+        Server::builder()
+            .max_concurrent_streams(100)
+            .http2_adaptive_window(Some(true))
+            .layer(in_flight_requests_layer)
+            .add_service(kv_service)
+            .add_service(maintenance_service)
+            .add_service(lease_service)
+            .add_service(watch_service)
+            .add_service(raft_service)
+            .serve(addr)
+            .await?;
+    } else {
+        // ── Original single-node mode ──
+        let kv_service = KvServer::new(KvService::new(Arc::clone(&store)));
+        let maintenance_service = MaintenanceServer::new(MaintenanceService::new(Arc::clone(&store)));
+        let watch_service = WatchServer::new(WatchService::new(Arc::clone(&store)));
+        let lease_service = LeaseServer::new(LeaseService::new(Arc::clone(&store)));
+
+        let metrics_app = Router::new().route("/metrics", get(move || {
+            let store = Arc::clone(&store);
+            async move {
+                metrics::REVISION_COUNT.set(store.current_revision() as i64);
+                metrics::COMPACTED_REVISION_COUNT.set(store.compacted_revision() as i64);
+                metrics::WATCHER_COUNT.set(store.watcher_count());
+                let metric_families = prometheus::gather();
+                let mut buf = Vec::new();
+                let encoder = TextEncoder::new();
+                encoder.encode(&metric_families, &mut buf).unwrap();
+                String::from_utf8(buf).unwrap()
+            }
+        }));
+        let metrics_listener = tokio::net::TcpListener::bind(format!("[::]:{}", cli.metrics_port)).await.unwrap();
+        tokio::spawn(async move {
+            axum::serve(metrics_listener, metrics_app).await.unwrap();
+        });
+
+        let (in_flight_requests_layer, in_flight_requests_counter) = InFlightRequestsLayer::pair();
+        tokio::spawn(
+            in_flight_requests_counter.run_emitter(std::time::Duration::from_secs(5), |counter| async move {
+                metrics::IN_FLIGHT_REQUESTS.set(counter as i64);
+            }),
+        );
+
+        println!("Starting gRPC server on {} (single-node mode)", addr);
+        Server::builder()
+            .max_concurrent_streams(100)
+            .http2_adaptive_window(Some(true))
+            .layer(in_flight_requests_layer)
+            .add_service(kv_service)
+            .add_service(maintenance_service)
+            .add_service(lease_service)
+            .add_service(watch_service)
+            .serve(addr)
+            .await?;
+    }
 
     Ok(())
 }

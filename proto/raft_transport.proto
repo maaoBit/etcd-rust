@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package raftpb;
+
+// Simple Raft transport service for cross-process communication.
+// Uses serialized payloads instead of typed proto messages,
+// because openraft types are already serde-serializable.
+service RaftTransport {
+  // Generic Raft RPC: path determines the operation type.
+  rpc raft_rpc(RaftPayload) returns (RaftPayload);
+}
+
+message RaftPayload {
+  // RPC path: "/raft/append", "/raft/vote", "/raft/snapshot"
+  string path = 1;
+  // serde_json serialized request
+  bytes data = 2;
+}
