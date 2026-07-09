@@ -167,9 +167,10 @@ impl Watch for WatchService {
                                 return;
                             }
                             Ok(None) => {
-                                // Client closed the stream; stop watching and exit.
-                                store.unwatch(key, watcher_id);
-                                return;
+                                // Client closed the stream. Don't exit - watcher can still receive events
+                                // until explicitly cancelled via CancelRequest.
+                                // Small sleep to avoid busy-loop when client stream is done but watcher events may arrive.
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                             }
                             Ok(Some(client_msg)) => {
                                 match client_msg.request_union {

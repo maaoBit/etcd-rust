@@ -1,0 +1,61 @@
+syntax = "proto3";
+package v3electionpb;
+
+service Election {
+  rpc Campaign(CampaignRequest) returns (CampaignResponse);
+  rpc Proclaim(ProclaimRequest) returns (ProclaimResponse);
+  rpc Leader(LeaderRequest) returns (LeaderResponse);
+  rpc Observe(ObserveRequest) returns (stream LeaderResponse);
+  rpc Resign(ResignRequest) returns (ResignResponse);
+}
+
+message CampaignRequest {
+  bytes name = 2;
+  int64 lease = 3;
+  bytes value = 4;
+}
+
+message CampaignResponse {
+  bytes leader_key = 2;
+  bytes leader_value = 3;
+  int64 leader_create_revision = 4;
+  int64 leader_mod_revision = 5;
+  int64 leader_version = 6;
+  int64 leader_lease = 7;
+  int64 revision = 8;
+}
+
+message ProclaimRequest {
+  bytes name = 2;
+  bytes value = 4;
+}
+
+message ProclaimResponse {
+  int64 revision = 1;
+}
+
+message LeaderRequest {
+  bytes name = 2;
+}
+
+message LeaderResponse {
+  bytes kv_key = 2;
+  bytes kv_value = 3;
+  int64 kv_create_revision = 4;
+  int64 kv_mod_revision = 5;
+  int64 kv_version = 6;
+  int64 kv_lease = 7;
+  int64 revision = 8;
+}
+
+message ResignRequest {
+  bytes name = 2;
+}
+
+message ResignResponse {
+  int64 revision = 1;
+}
+
+message ObserveRequest {
+  bytes name = 2;
+}

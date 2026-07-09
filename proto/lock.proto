@@ -1,0 +1,30 @@
+syntax = "proto3";
+package v3lockpb;
+
+service Lock {
+  rpc Lock(LockRequest) returns (LockResponse);
+  rpc Unlock(UnlockRequest) returns (UnlockResponse);
+}
+
+message LockRequest {
+  bytes name = 2;
+  int64 lease = 3;
+}
+
+message LockResponse {
+  bytes kv_key = 2;
+  bytes kv_value = 3;
+  int64 kv_create_revision = 4;
+  int64 kv_mod_revision = 5;
+  int64 kv_version = 6;
+  int64 kv_lease = 7;
+  int64 revision = 8;
+}
+
+message UnlockRequest {
+  bytes name = 2;
+}
+
+message UnlockResponse {
+  int64 revision = 1;
+}

@@ -9,11 +9,18 @@ mod store;
 mod watch_service;
 mod wal;
 mod maintenance_service;
+mod membership;
+mod lease;
+mod alarm;
+mod election;
+mod lock;
 
 use etcdserverpb::kv_server::KvServer;
 use etcdserverpb::maintenance_server::MaintenanceServer;
 use etcdserverpb::lease_server::LeaseServer;
 use etcdserverpb::watch_server::WatchServer;
+use v3electionpb::election_server::ElectionServer;
+use v3lockpb::lock_server::LockServer;
 
 use bytes::Bytes;
 use std::sync::Arc;
@@ -28,6 +35,9 @@ use std::net::SocketAddr;
 use tonic::transport::Server;
 use tower_http::metrics::InFlightRequestsLayer;
 use watch_service::WatchService;
+use election::ElectionService;
+use lock::LockService;
+use lease::lessor::Lessor;
 
 use prometheus::{TextEncoder, Encoder};
 use axum::{
@@ -45,6 +55,14 @@ mod mvccpb {
 
 mod etcdserverpb {
     tonic::include_proto!("etcdserverpb");
+}
+
+mod v3electionpb {
+    tonic::include_proto!("v3electionpb");
+}
+
+mod v3lockpb {
+    tonic::include_proto!("v3lockpb");
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq)]
@@ -117,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let store = Arc::new(store::Store::new(wal_settings));
 
+    // Create the Lessor for lease management used by election and lock services
+    let lessor = Arc::new(Lessor::new(store.clone()));
+
     // etcd initializes with rev at 1, so set a dummy key to take rev 0
     store.set(b"~".to_vec(), Some(Bytes::from(b"".to_vec())), None).await.unwrap();
 
@@ -128,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let peers_str = cli.raft_peers.as_deref().ok_or("--raft-peers is required when --raft-enabled")?;
         let peers = raft::parse_peers(peers_str)?;
 
-        let (raft, grpc_service) = raft::create_grpc_raft_node(node_id, peers.clone(), store.clone()).await?;
+        let (raft, grpc_service, _sm_store) = raft::create_grpc_raft_node(node_id, peers.clone(), store.clone(), None).await?;
         raft_node = Some(raft.clone());
 
         // Spawn cluster initialization after gRPC server starts
@@ -168,6 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let maintenance_service = MaintenanceServer::new(MaintenanceService::new(Arc::clone(&store)));
         let watch_service = WatchServer::new(WatchService::new(Arc::clone(&store)));
         let lease_service = LeaseServer::new(LeaseService::new(Arc::clone(&store)));
+        let election_service = ElectionServer::new(ElectionService::new(Arc::clone(&store), lessor.clone()));
+        let lock_service = LockServer::new(LockService::new(Arc::clone(&store), lessor.clone()));
         let raft_service = grpc_service.into_server();
 
         let (in_flight_requests_layer, in_flight_requests_counter) = InFlightRequestsLayer::pair();
@@ -210,6 +233,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(kv_service)
             .add_service(maintenance_service)
             .add_service(lease_service)
+            .add_service(election_service)
+            .add_service(lock_service)
             .add_service(watch_service)
             .add_service(raft_service)
             .serve(addr)
@@ -220,6 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let maintenance_service = MaintenanceServer::new(MaintenanceService::new(Arc::clone(&store)));
         let watch_service = WatchServer::new(WatchService::new(Arc::clone(&store)));
         let lease_service = LeaseServer::new(LeaseService::new(Arc::clone(&store)));
+        let election_service = ElectionServer::new(ElectionService::new(Arc::clone(&store), lessor.clone()));
+        let lock_service = LockServer::new(LockService::new(Arc::clone(&store), lessor.clone()));
 
         let metrics_app = Router::new().route("/metrics", get(move || {
             let store = Arc::clone(&store);
@@ -254,6 +281,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .add_service(kv_service)
             .add_service(maintenance_service)
             .add_service(lease_service)
+            .add_service(election_service)
+            .add_service(lock_service)
             .add_service(watch_service)
             .serve(addr)
             .await?;

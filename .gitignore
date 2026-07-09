@@ -18,5 +18,10 @@ target/
 # Go (porcupine test)
 tests/porcupine-test/go.sum
 
+# Claude / OMC generated files
+.claude/
+.omc/
+AGENTS.md
+
 # WAL data (runtime)
 wal/

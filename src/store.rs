@@ -89,8 +89,7 @@ pub struct KeyValueWithPrev {
     pub kv: KeyValue,
 }
 
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SetRequired {
     pub required_last_revision: Option<i64>,
     pub required_version: Option<i64>,
@@ -393,7 +392,7 @@ impl Store {
 
     /// Synchronous version of set() for WAL replay during startup.
     /// Does not notify watchers (none exist yet) and does not append to WAL (we're reading from it).
-    fn set_for_replay(&self, key: ByteArray, value: Option<Bytes>) {
+    pub(crate) fn set_for_replay(&self, key: ByteArray, value: Option<Bytes>) {
         let value = value.map(|v| Bytes::from(v));
         let (prefix, suffix) = Self::prefix_split(&key);
 
